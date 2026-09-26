@@ -5,11 +5,15 @@
    output (GPIO25). Time comes from NTP over WiFi and is sent as Dutch
    local time with automatic summer/winter time (TIMEZONE in config.h).
 
+   Optional PCF8583 real-time clock (I2C + 1 Hz INT): when it holds a valid
+   time the output starts straight away and runs on the PCF8583; NTP then
+   only corrects it. Without a PCF8583 the output runs on NTP.
+
    BOOT button: press after start-up to open the WiFi configuration portal.
    Onboard LED:
      fast blink   captive portal active
      slow blink   connecting to WiFi
-     steady on    WiFi connected, waiting for NTP
+     steady on    WiFi connected, waiting for NTP (or a valid PCF8583 time)
      heartbeat    IRIG-B output running (short off at every second)
 
    Board: ESP32 DevKit (esp32dev), Arduino-ESP32 core 3.x
@@ -21,6 +25,7 @@
 #include "src/config.h"
 #include "src/IrigB.h"
 #include "src/StatusLed.h"
+#include "src/TimeRef.h"
 #include "src/WiFiConnect.h"
 
 WiFiConnect wc;
@@ -165,7 +170,11 @@ void setup() {
   statusLedBegin();
   statusLedSet(LED_CONNECTING);
 
+  setenv("TZ", TIMEZONE, 1);
+  tzset();
+
   loadSettings();
+  timeRefBegin();
   irigBegin();
 
   WiFi.onEvent(onWiFiGotIP, ARDUINO_EVENT_WIFI_STA_GOT_IP);
@@ -193,9 +202,9 @@ void loop() {
     startNtp();
   }
 
-  // Output starts on the first NTP sync and then keeps running on the
-  // internal clock, also when WiFi or NTP is lost.
-  if (ntpSynced && !irigRunning()) irigEnable(true);
+  // Output starts on a valid PCF8583 time or on the first NTP sync, and then
+  // keeps running, also when WiFi or NTP is lost.
+  if ((timeRefRtcValid() || ntpSynced) && !irigRunning()) irigEnable(true);
 
   if (irigRunning()) {
     statusLedSet(LED_HEARTBEAT);
@@ -212,17 +221,19 @@ void loop() {
     struct tm tm;
     localtime_r(&now, &tm);
     Serial.printf("[NTP] synced, local time %02d:%02d:%02d\n", tm.tm_hour, tm.tm_min, tm.tm_sec);
+    timeRefSyncRtc();   // correct the PCF8583, if present
   }
 
   static uint32_t lastLog = millis();
   if (millis() - lastLog >= (irigRunning() ? 60000UL : 10000UL)) {
     lastLog = millis();
-    time_t now = time(NULL);
+    time_t now = (time_t)(timeRefNowUs() / 1000000);
     struct tm tm;
     localtime_r(&now, &tm);
-    Serial.printf("[STAT] %04d-%02d-%02d %02d:%02d:%02d day %03d, WiFi %s, NTP %s (%lu syncs), IRIG %s, phase %ld us\n",
+    Serial.printf("[STAT] %04d-%02d-%02d %02d:%02d:%02d day %03d, clock %s, WiFi %s, NTP %s (%lu syncs), IRIG %s, phase %ld us\n",
                   tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
-                  tm.tm_yday + 1, WiFi.status() == WL_CONNECTED ? "ok" : "down",
+                  tm.tm_yday + 1, timeRefRtcValid() ? "PCF8583" : "NTP",
+                  WiFi.status() == WL_CONNECTED ? "ok" : "down",
                   ntpSynced ? "ok" : "waiting", (unsigned long)ntpSyncCount,
                   irigRunning() ? "on" : "off", (long)irigLastErrorUs());
   }

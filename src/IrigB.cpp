@@ -6,7 +6,8 @@
    crossing, so the carrier is phase-coherent with the bit clock.
 
    The timer ISR marks every frame start with esp_timer_get_time() and wakes
-   the frame task. That task compares the stamp with the system clock and
+   the frame task. That task compares the stamp with the time reference
+   (PCF8583 or system clock, see TimeRef) and
    sets a correction of whole samples, which the ISR applies at bit
    boundaries (at most one sample per bit): drop the zero-crossing sample to
    shorten, or hold it one extra sample to lengthen. It then builds the
@@ -21,6 +22,7 @@
 #include <esp_timer.h>
 #include "hal/dac_ll.h"
 #include "config.h"
+#include "TimeRef.h"
 
 static_assert(1000000 % IRIG_SAMPLE_RATE == 0, "IRIG_SAMPLE_RATE must divide 1 MHz");
 static_assert(IRIG_SAMPLE_RATE % IRIG_CARRIER_HZ == 0, "IRIG_SAMPLE_RATE must be a multiple of the carrier");
@@ -163,16 +165,8 @@ static void buildFrame(uint8_t buf, int64_t epochSec) {
   s_frameSec[buf] = epochSec;
 }
 
-/// System time minus esp_timer time, in microseconds
-static int64_t clockOffsetUs() {
-  struct timeval tv;
-  gettimeofday(&tv, NULL);
-  int64_t mono = esp_timer_get_time();
-  return (int64_t)tv.tv_sec * 1000000 + tv.tv_usec - mono;
-}
-
 static void scheduleStart() {
-  int64_t offset = clockOffsetUs();
+  int64_t offset = timeRefOffsetUs();
   int64_t nowUs = esp_timer_get_time() + offset;
   int64_t sec = nowUs / 1000000 + 1;
   if (sec * 1000000 - nowUs < 100000) sec++;   // leave time to prepare
@@ -206,7 +200,7 @@ static void frameTask(void *) {
     }
 
     // Phase error of the frame that just started
-    int64_t frameUs = s_frameStampUs + clockOffsetUs();
+    int64_t frameUs = s_frameStampUs + timeRefOffsetUs();
     int64_t sec = (frameUs + 500000) / 1000000;
     int64_t err = frameUs - sec * 1000000;
     s_lastErrUs = (int32_t)err;

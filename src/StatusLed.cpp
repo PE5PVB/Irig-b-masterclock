@@ -4,8 +4,8 @@
 #include "StatusLed.h"
 
 #include <Arduino.h>
-#include <sys/time.h>
 #include "config.h"
+#include "TimeRef.h"
 
 static volatile LedMode s_mode = LED_OFF;
 
@@ -25,9 +25,7 @@ static void ledTask(void *) {
       case LED_CONNECTED:  on = true; break;
       case LED_HEARTBEAT: {
         // Dark during the first 100 ms of each second, aligned with the IRIG frame start
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        on = tv.tv_usec >= 100000;
+        on = timeRefNowUs() % 1000000 >= 100000;
         break;
       }
     }

@@ -10,6 +10,14 @@
 #define LED_ACTIVE_HIGH   1       // 1 = LED lights when pin is HIGH
 #define PIN_BUTTON        0       // BOOT button, active LOW
 
+// ---- PCF8583 real-time clock (optional) ----
+// When present, the PCF8583 is the master clock; NTP only corrects it.
+#define PIN_I2C_SDA       21
+#define PIN_I2C_SCL       22
+#define PIN_RTC_INT       4       // PCF8583 INT (open drain, 1 Hz), needs a pull-up
+#define RTC_I2C_ADDR      0x50    // A0 to GND; 0x51 with A0 to VDD
+#define RTC_SET_THRESHOLD_US 20000  // correct the PCF when it deviates more than this from NTP
+
 // ---- IRIG-B pulse widths (high time within a 10 ms bit) ----
 // IRIG 200 standard: 0 = 2 ms, 1 = 5 ms, marker = 8 ms.
 // Swap IRIG_MS_ZERO and IRIG_MS_ONE for inverted bit coding.

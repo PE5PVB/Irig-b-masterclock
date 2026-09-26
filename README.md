@@ -40,10 +40,21 @@ B122 heeft geen zomertijdvlag. Bij de overgang springt de tijd in het signaal ee
 ### Tijd en synchronisatie
 
 - De ESP32 synchroniseert elke 5 minuten met een NTP-server (standaard `pool.ntp.org`).
+- Is er een PCF8583 real-time clock aangesloten, dan is die de hoofdklok (zie hieronder).
 - Een hardware timer stuurt de DAC op 40 kHz aan (40 samples per sinusperiode). Elke bit begint op een positieve nuldoorgang van de sinus.
-- Bij elke framestart vergelijkt de firmware het tijdstip met de systeemklok en corrigeert zo nodig in stappen van 25 µs, maximaal één stap per bit. Is de afwijking groter dan 100 ms, dan start de uitvoer opnieuw op de volgende seconde.
+- Bij elke framestart vergelijkt de firmware het tijdstip met de hoofdklok (PCF8583 of NTP) en corrigeert zo nodig in stappen van 25 µs, maximaal één stap per bit. Is de afwijking groter dan 100 ms, dan start de uitvoer opnieuw op de volgende seconde.
 - Valt WiFi of NTP weg, dan loopt de uitvoer door op de interne klok van de ESP32 (drift in de orde van enkele tientallen ms per uur).
 - De nauwkeurigheid is die van NTP over WiFi: ruwweg 1–10 ms ten opzichte van UTC.
+
+### PCF8583 real-time clock (optioneel)
+
+Met een PCF8583 met backup-batterij start de klok direct na het aanzetten, ook zonder WiFi.
+
+- **Bij het opstarten** zoekt de firmware de PCF8583 op I2C. Staat er een geldige tijd in, dan start de IRIG-B uitvoer meteen op die tijd. Zo niet, dan wacht de klok op NTP, zet de PCF8583 gelijk en start dan.
+- **Daarna is de PCF8583 de hoofdklok.** De frames lopen op de 1 Hz puls van de PCF8583 (INT-pin); de klok van de ESP32 wordt daarvoor niet gebruikt.
+- **NTP stelt de PCF8583 bij.** Na elke NTP-synchronisatie wordt de afwijking gemeten en gelogd. Is die groter dan 20 ms (`RTC_SET_THRESHOLD_US`), dan wordt de PCF8583 opnieuw gelijkgezet, precies op de secondegrens.
+- **Geen PCF8583 gevonden**, of geen 1 Hz puls op INT: dan werkt alles zoals zonder PCF8583, op NTP.
+- De PCF8583 bevat UTC. Het volledige jaartal en een geldigheidsmarkering staan in zijn RAM (de PCF8583 telt zelf maar 2 jaarbits). Een PCF8583 die door een ander apparaat of programma is ingesteld, ziet de firmware daarom als ongeldig en zet hem via NTP gelijk.
 
 ## Hardware
 
@@ -57,6 +68,23 @@ B122 heeft geen zomertijdvlag. Bij de overgang springt de tijd in het signaal ee
 | IRIG-B uitgang (DAC) | 25 |
 | Status-LED (op het board) | 2 |
 | BOOT-knop (op het board) | 0 |
+| PCF8583 SDA (optioneel) | 21 |
+| PCF8583 SCL (optioneel) | 22 |
+| PCF8583 INT (optioneel) | 4 |
+
+**PCF8583 aansluiten:**
+
+| PCF8583 | Naar |
+|---|---|
+| VDD (pin 8) | 3V3 |
+| VSS (pin 4) | GND |
+| SDA (pin 5) | GPIO21, 4,7 kΩ pull-up naar 3V3 |
+| SCL (pin 6) | GPIO22, 4,7 kΩ pull-up naar 3V3 |
+| INT (pin 7) | GPIO4, 10 kΩ pull-up naar 3V3 (open drain, 1 Hz) |
+| A0 (pin 3) | GND (I2C-adres 0x50) |
+| OSCI / OSCO (pin 1 / 2) | 32,768 kHz kristal |
+
+Voor een kant-en-klare module zijn de pull-ups vaak al aanwezig. Geef de PCF8583 een backup-batterij (bijvoorbeeld een CR2032 via een diode op VDD), anders is de tijd na een spanningsonderbreking weg. Pinnen en adres staan in `src/config.h`.
 
 Op GPIO25 staat het AM-signaal rond 1,65 V: ongeveer 3,1 Vtt tijdens mark en 1,0 Vtt tijdens space. De DAC kan nauwelijks stroom leveren, dus sluit een ontvanger niet direct aan.
 
@@ -111,12 +139,12 @@ Druk na het opstarten kort op de **BOOT**-knop om de portal opnieuw te openen. N
 |---|---|
 | Snel knipperen | Configuratie-portal actief |
 | Langzaam knipperen | Verbinden met WiFi |
-| Continu aan | WiFi verbonden, wacht op NTP |
+| Continu aan | WiFi verbonden, wacht op NTP (of op een geldige PCF8583-tijd) |
 | Hartslag (kort uit op elke seconde) | IRIG-B uitvoer loopt |
 
 ### Seriële monitor
 
-Op 115200 baud toont de ESP32 status-meldingen, onder andere `[NTP] synced` bij elke synchronisatie en elke minuut een `[STAT]` regel met tijd, WiFi-status en de fase-afwijking van het signaal.
+Op 115200 baud toont de ESP32 status-meldingen, onder andere `[NTP] synced` bij elke synchronisatie, `[RTC]` meldingen van de PCF8583 (inclusief de afwijking ten opzichte van NTP) en elke minuut een `[STAT]` regel met tijd, hoofdklok, WiFi-status en de fase-afwijking van het signaal.
 
 ## Zelf bouwen
 
@@ -130,6 +158,7 @@ Op 115200 baud toont de ESP32 status-meldingen, onder andere `[NTP] synced` bij 
 | `IRIG_B_Masterclock.ino` | opstarten, knop, WiFi, NTP, instellingen, status |
 | `src/config.h` | pinnen, pulsduren, amplitude, tijdzone, sync-instellingen |
 | `src/IrigB.cpp` | IRIG-B generator (timer, DAC, frame-opbouw, synchronisatie) |
+| `src/TimeRef.cpp` | hoofdklok: PCF8583 (I2C en 1 Hz puls) of NTP |
 | `src/StatusLed.cpp` | LED-patronen |
 | `src/WiFiConnect.cpp` | captive portal |
 | `tools/publish.py` | kopieert de firmware na de build naar `publish/` |
