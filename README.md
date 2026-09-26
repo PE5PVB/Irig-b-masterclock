@@ -118,28 +118,6 @@ Druk na het opstarten kort op de **BOOT**-knop om de portal opnieuw te openen. N
 
 Op 115200 baud toont de ESP32 status-meldingen, onder andere `[NTP] synced` bij elke synchronisatie en elke minuut een `[STAT]` regel met tijd, WiFi-status en de fase-afwijking van het signaal.
 
-## Firmware flashen (zonder ontwikkelomgeving)
-
-De map `publish/` bevat de gecompileerde firmware en alles om die te flashen:
-
-| Bestand | Inhoud |
-|---|---|
-| `IRIG_B_Masterclock.bin` | applicatie |
-| `bootloader.bin`, `partitions.bin`, `boot_app0.bin` | bootloader, partitietabel en opstartselectie |
-| `flash_args.txt` | flash-adres per bestand |
-| `esptool.exe` | flash-tool van Espressif |
-| `flash.bat` | flash-script |
-
-De bestanden worden los op hun eigen adres geflasht. Het NVS-gebied met de WiFi-instellingen wordt daardoor niet overschreven.
-
-1. Sluit de ESP32 aan via USB.
-2. Start `flash.bat`. Het script toont de gevonden COM-poorten.
-3. Typ het poortnummer (bijvoorbeeld `5` of `COM5`) en druk op Enter.
-
-Lukt flashen niet op hoge snelheid, dan probeert het script het automatisch opnieuw op 115200 baud. Houd dan eventueel de BOOT-knop ingedrukt tot het flashen begint. WiFi-instellingen blijven na het flashen bewaard.
-
-De map `publish/` staat niet op GitHub; PlatformIO vult hem bij elke build (`tools/publish.py`).
-
 ## Zelf bouwen
 
 - **PlatformIO**: `pio run` bouwt de firmware en zet het resultaat in `publish/`; `pio run -t upload` flasht direct. Vereist het pioarduino platform (Arduino-ESP32 core 3.x).
