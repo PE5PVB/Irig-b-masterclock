@@ -12,7 +12,7 @@
 
    Simplified for ESP32-only use. Removed: ESP8266 support, OLED display,
    debug output, params-only portal, and callbacks.
-   Taken from the TEF6686_ESP32 project; UI texts built in (Dutch), logo removed.
+   Taken from the TEF6686_ESP32 project; UI texts built in (English), logo removed.
 
    GNU General Public License v3.0
 */
@@ -52,6 +52,13 @@ public:
   /// Construct an input field parameter
   WiFiConnectParam(const char *id, const char *placeholder, const char *defaultValue, int length);
 
+  /// Construct a form field with its own HTML (select, checkbox), set with setCustomHTML().
+  /// The submitted value for this id is stored like that of an input field.
+  WiFiConnectParam(const char *id, int length);
+
+  /// Replace the custom HTML (label text, or the HTML of a custom form field)
+  void setCustomHTML(const char *html);
+
   /// Destructor - frees the allocated value buffer
   ~WiFiConnectParam();
 
@@ -67,6 +74,7 @@ private:
   char       *_value;
   int         _length;
   const char *_customHTML;
+  bool        _rawField = false;
 
   void init(const char *id, const char *placeholder, const char *defaultValue, int length, const char *custom);
   void setValue(const char *newValue);

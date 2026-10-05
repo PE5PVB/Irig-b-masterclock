@@ -28,7 +28,12 @@ int64_t timeRefOffsetUs();
 /// Reference time now (UTC epoch, microseconds)
 int64_t timeRefNowUs();
 
-/// Compare the PCF8583 with the (NTP-synced) system clock and correct it when needed
-void timeRefSyncRtc();
+/// Compare the PCF8583 with the (NTP-synced) system clock and correct it when
+/// needed. trust: correct on this check without waiting for confirmation
+void timeRefSyncRtc(bool trust);
+
+/// Set the PCF8583 to a manually entered time: `epoch` (UTC seconds) was the
+/// time at esp_timer time `pressUs`
+void timeRefSetRtc(int64_t epoch, int64_t pressUs);
 
 #endif

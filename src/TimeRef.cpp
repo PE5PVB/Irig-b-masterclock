@@ -2,13 +2,15 @@
    TimeRef.cpp - Time reference for the IRIG-B output (PCF8583 or system clock)
 
    PCF8583 notes:
-   - With the alarm disabled, INT outputs a 1 Hz square wave. One edge falls on
-     the seconds increment, the other half a second later. After each edge the
-     hundredths register is read: below 50 means it was the second edge.
+   - With the alarm disabled, INT outputs a 1 Hz square wave. Its edges do not
+     fall on the seconds increment, but at a fixed, unknown point in the PCF
+     second. After each edge the hundredths register is polled until it
+     changes: that change happens at a known PCF time, so the PCF time of the
+     edge follows from it (about 0.1 ms precision). Both edges are used.
    - The PCF8583 keeps only 2 year bits. The full year is stored in its RAM,
      together with a marker that says the time was set by this firmware.
    - The PCF8583 holds UTC; the IRIG frames are converted to local time.
-   - All I2C traffic runs in the RTC task.
+   - All PCF8583 traffic runs in the RTC task, under the shared I2C bus lock.
 */
 #include "TimeRef.h"
 
@@ -18,6 +20,7 @@
 #include <time.h>
 #include <esp_timer.h>
 #include "config.h"
+#include "I2cBus.h"
 
 // PCF8583 registers
 #define REG_CONTROL     0x00
@@ -33,7 +36,9 @@
 #define RAM_MAGIC0      'I'
 #define RAM_MAGIC1      'B'
 
-#define EDGE_TIMEOUT_US 3000000 // no second edge for this long: RTC failed
+#define EDGE_TIMEOUT_US 3000000 // no edge for this long: RTC failed
+#define POLL_TIMEOUT_US 15000   // hundredths must change within this time
+#define OFFSET_JUMP_US  2000    // larger offset change: restart the filter
 
 struct RtcTime {
   bool    valid;
@@ -45,10 +50,18 @@ static bool              s_present = false;   // PCF8583 answers on I2C
 static volatile bool     s_failed = false;    // no 1 Hz on INT: fall back to system clock
 static volatile bool     s_valid = false;     // PCF8583 holds a valid time
 static volatile bool     s_syncRequest = false;
+static volatile bool     s_syncTrust = false;  // correct on this check without confirmation
 static int64_t           s_offsetUs = 0;      // PCF epoch us minus esp_timer us
 static portMUX_TYPE      s_mux = portMUX_INITIALIZER_UNLOCKED;
 static QueueHandle_t     s_edgeQueue = NULL;
-static int64_t           s_lastSecondEdge = 0;
+static int64_t           s_lastEdge = 0;
+static bool              s_haveOffset = false; // filtered offset initialised
+static int64_t           s_filtOffsetUs = 0;   // filtered PCF epoch us minus esp_timer us
+static int               s_phaseLogs = 0;      // edge phases still to log
+static int               s_lastDevDir = 0;     // direction of the last NTP deviation over the threshold
+static volatile bool     s_manualRequest = false;
+static int64_t           s_manualEpoch = 0;    // manually entered time (UTC seconds)...
+static int64_t           s_manualPressUs = 0;  // ...valid at this esp_timer time
 
 // ---- Helpers ----
 
@@ -81,19 +94,27 @@ static void setOffset(int64_t us) {
 // ---- PCF8583 access ----
 
 static bool rtcWrite(uint8_t reg, const uint8_t *data, size_t len) {
+  i2cLock();
   Wire.beginTransmission(RTC_I2C_ADDR);
   Wire.write(reg);
   Wire.write(data, len);
-  return Wire.endTransmission() == 0;
+  bool ok = Wire.endTransmission() == 0;
+  i2cUnlock();
+  return ok;
 }
 
 static bool rtcRead(uint8_t reg, uint8_t *data, size_t len) {
+  bool ok = false;
+  i2cLock();
   Wire.beginTransmission(RTC_I2C_ADDR);
   Wire.write(reg);
-  if (Wire.endTransmission(false) != 0) return false;
-  if (Wire.requestFrom((uint8_t)RTC_I2C_ADDR, (uint8_t)len) != len) return false;
-  for (size_t i = 0; i < len; i++) data[i] = Wire.read();
-  return true;
+  if (Wire.endTransmission(false) == 0 &&
+      Wire.requestFrom((uint8_t)RTC_I2C_ADDR, (uint8_t)len) == len) {
+    for (size_t i = 0; i < len; i++) data[i] = Wire.read();
+    ok = true;
+  }
+  i2cUnlock();
+  return ok;
 }
 
 static bool readRtcTime(RtcTime &t) {
@@ -130,11 +151,15 @@ static bool readRtcTime(RtcTime &t) {
   return true;
 }
 
-/// Set the PCF8583 to the system clock, released exactly on a second boundary
-static void setRtcFromSystem() {
-  int64_t sysOffset = systemOffsetUs();
-  int64_t nowUs = esp_timer_get_time() + sysOffset;
-  int64_t target = nowUs / 1000000 + 2;
+/// Set the PCF8583 to `target` (UTC seconds), counting starts at esp_timer time `releaseAt`
+static void setRtcAt(int64_t target, int64_t releaseAt) {
+  // The new PCF time line is known now: switch display and IRIG over at once
+  // instead of after the first edge following the release. The start byte
+  // reaches the PCF8583 ~70 us after releaseAt.
+  s_filtOffsetUs = target * 1000000 - (releaseAt + 70);
+  s_haveOffset = true;
+  setOffset(s_filtOffsetUs);
+  s_valid = true;
 
   time_t t = (time_t)target;
   struct tm tm;
@@ -160,18 +185,41 @@ static void setRtcFromSystem() {
     return;
   }
 
-  // Release the counter on the second boundary; the start byte takes ~70 us on the bus
-  int64_t releaseAt = target * 1000000 - sysOffset - 70;
-  int64_t waitUs = releaseAt - esp_timer_get_time() - 20000;
+  // Release the counter at releaseAt. Take the bus well before, so a display
+  // update cannot delay the release.
+  int64_t waitUs = releaseAt - esp_timer_get_time() - 100000;
   if (waitUs > 0) vTaskDelay(pdMS_TO_TICKS(waitUs / 1000));
+  i2cLock();
+  int64_t lateUs = esp_timer_get_time() - releaseAt;
   while (esp_timer_get_time() < releaseAt) { }
   uint8_t run = 0x00;
   rtcWrite(REG_CONTROL, &run, 1);
+  i2cUnlock();
+  if (lateUs > 0) Serial.printf("[RTC] released %lld us late\n", (long long)lateUs);
 
   xQueueReset(s_edgeQueue);          // drop edges seen while stopped
-  s_lastSecondEdge = esp_timer_get_time();
+  s_lastEdge = esp_timer_get_time();
+  s_phaseLogs = 2;
+  s_lastDevDir = 0;
   Serial.printf("[RTC] set to %04d-%02d-%02d %02d:%02d:%02d UTC\n",
                 year, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+}
+
+/// Set the PCF8583 to the system clock, released exactly on a second boundary
+static void setRtcFromSystem() {
+  int64_t sysOffset = systemOffsetUs();
+  int64_t target = (esp_timer_get_time() + sysOffset) / 1000000 + 2;
+  // The start byte takes ~70 us on the bus
+  setRtcAt(target, target * 1000000 - sysOffset - 70);
+}
+
+/// Set the PCF8583 to the manually entered time. That time was valid at the
+/// press; release a whole number of seconds later so the PCF8583 starts on
+/// the same second grid.
+static void setRtcManual(int64_t epoch, int64_t pressUs) {
+  int64_t k = 1;
+  while (pressUs + k * 1000000 - esp_timer_get_time() < 150000) k++;
+  setRtcAt(epoch + k, pressUs + k * 1000000 - 70);
 }
 
 // ---- 1 Hz edge handling ----
@@ -183,49 +231,133 @@ static void IRAM_ATTR onRtcEdge() {
   if (woken) portYIELD_FROM_ISR();
 }
 
+/// PCF time (UTC epoch us) at an edge: poll the hundredths register until it
+/// changes. The change happens on a whole hundredth of PCF time, so the edge
+/// lies (change time - edge time) before that.
+static bool edgePcfTime(const RtcTime &t, int64_t edge, int64_t &pcfUs) {
+  bool ok = false;
+  i2cLock();                         // keep the bus free of display traffic while polling
+  uint8_t r;
+  if (!rtcRead(REG_HUNDREDTHS, &r, 1)) {
+    i2cUnlock();
+    return false;
+  }
+  int64_t start = esp_timer_get_time();
+  int64_t prevEnd = start;
+  uint8_t h0 = bcd2bin(r);
+  int64_t epoch = t.epoch + (h0 < t.hundredths ? 1 : 0);   // second rolled over since readRtcTime
+  for (;;) {
+    if (!rtcRead(REG_HUNDREDTHS, &r, 1)) break;
+    int64_t end = esp_timer_get_time();
+    uint8_t h = bcd2bin(r);
+    if (h != h0) {
+      if ((h + 100 - h0) % 100 == 1) {
+        int64_t changeAt = (prevEnd + end) / 2;
+        pcfUs = epoch * 1000000 + (int64_t)(h0 + 1) * 10000 - (changeAt - edge);
+        ok = true;
+      }
+      break;
+    }
+    prevEnd = end;
+    if (end - start > POLL_TIMEOUT_US) break;
+  }
+  i2cUnlock();
+  return ok;
+}
+
 static void rtcTask(void *) {
   for (;;) {
+    if (s_manualRequest) {
+      portENTER_CRITICAL(&s_mux);
+      int64_t epoch = s_manualEpoch;
+      int64_t pressUs = s_manualPressUs;
+      s_manualRequest = false;
+      portEXIT_CRITICAL(&s_mux);
+      setRtcManual(epoch, pressUs);
+    }
+
     int64_t edge;
-    if (xQueueReceive(s_edgeQueue, &edge, pdMS_TO_TICKS(500)) != pdTRUE) {
-      if (!s_failed && esp_timer_get_time() - s_lastSecondEdge > EDGE_TIMEOUT_US) {
+    if (xQueueReceive(s_edgeQueue, &edge, pdMS_TO_TICKS(50)) != pdTRUE) {
+      if (!s_failed && esp_timer_get_time() - s_lastEdge > EDGE_TIMEOUT_US) {
         s_failed = true;
         s_valid = false;
         Serial.printf("[RTC] no 1 Hz signal on GPIO%d, using NTP only\n", PIN_RTC_INT);
       }
       continue;
     }
-    if (esp_timer_get_time() - edge > 300000) continue;   // too late to classify
+    if (esp_timer_get_time() - edge > 300000) continue;   // too late to use
+    if (s_manualRequest) continue;                          // PCF is about to be set
 
     RtcTime t;
-    if (!readRtcTime(t) || t.hundredths >= 50) continue;  // read error or half-second edge
+    if (!readRtcTime(t)) continue;
 
-    s_lastSecondEdge = edge;
+    s_lastEdge = edge;
     if (s_failed) {
       s_failed = false;
       Serial.println("[RTC] 1 Hz signal back");
     }
 
-    if (t.valid) {
-      setOffset(t.epoch * 1000000 - edge);
-      if (!s_valid) {
-        s_valid = true;
-        Serial.println("[RTC] time valid, PCF8583 is the master clock");
+    if (!t.valid) {
+      if (s_valid) {
+        s_valid = false;
+        Serial.println("[RTC] time invalid");
       }
-    } else if (s_valid) {
-      s_valid = false;
-      Serial.println("[RTC] time invalid");
+      if (s_syncRequest) {
+        s_syncRequest = false;
+        Serial.println("[RTC] no valid time, setting from NTP");
+        setRtcFromSystem();
+      }
+      continue;
+    }
+
+    int64_t pcfUs;
+    if (!edgePcfTime(t, edge, pcfUs)) continue;
+
+    // Light filtering against I2C timing jitter; restart after a jump (PCF set)
+    int64_t sample = pcfUs - edge;
+    if (!s_haveOffset || llabs(sample - s_filtOffsetUs) > OFFSET_JUMP_US) {
+      s_filtOffsetUs = sample;
+      s_haveOffset = true;
+    } else {
+      s_filtOffsetUs += (sample - s_filtOffsetUs) / 8;
+    }
+    // Publish, unless a manual time arrived meanwhile (it already published its own)
+    portENTER_CRITICAL(&s_mux);
+    bool pending = s_manualRequest;
+    if (!pending) s_offsetUs = s_filtOffsetUs;
+    portEXIT_CRITICAL(&s_mux);
+    if (pending) continue;
+
+    if (s_phaseLogs > 0) {
+      s_phaseLogs--;
+      Serial.printf("[RTC] 1 Hz edge at %.1f ms in the PCF second\n", (pcfUs % 1000000) / 1000.0);
+    }
+
+    if (!s_valid) {
+      s_valid = true;
+      Serial.println("[RTC] time valid, PCF8583 is the master clock");
     }
 
     if (s_syncRequest) {
       s_syncRequest = false;
-      if (!t.valid) {
-        Serial.println("[RTC] no valid time, setting from NTP");
+      // Normally correct only when two NTP checks in a row exceed the threshold
+      // in the same direction, so a single bad NTP sample cannot move the master
+      // clock. Correct at once right after NTP was switched on, or when the
+      // deviation is far larger than an NTP error can be.
+      int64_t dev = s_filtOffsetUs - systemOffsetUs();
+      int dir = dev > RTC_SET_THRESHOLD_US ? 1 : (dev < -RTC_SET_THRESHOLD_US ? -1 : 0);
+      bool now = s_syncTrust || llabs(dev) > RTC_IMMEDIATE_US;
+      s_syncTrust = false;
+      if (dir != 0 && (now || dir == s_lastDevDir)) {
+        Serial.printf("[RTC] deviation from NTP %+.1f ms: correcting\n", dev / 1000.0);
         setRtcFromSystem();
+        dir = 0;
+      } else if (dir != 0) {
+        Serial.printf("[RTC] deviation from NTP %+.1f ms, waiting for confirmation\n", dev / 1000.0);
       } else {
-        int64_t dev = t.epoch * 1000000 - (edge + systemOffsetUs());
         Serial.printf("[RTC] deviation from NTP %+.1f ms\n", dev / 1000.0);
-        if (dev > RTC_SET_THRESHOLD_US || dev < -RTC_SET_THRESHOLD_US) setRtcFromSystem();
       }
+      s_lastDevDir = dir;
     }
   }
 }
@@ -233,9 +365,8 @@ static void rtcTask(void *) {
 // ---- Public API ----
 
 void timeRefBegin() {
-  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, 400000);
-  Wire.beginTransmission(RTC_I2C_ADDR);
-  s_present = Wire.endTransmission() == 0;
+  i2cBegin();
+  s_present = i2cProbe(RTC_I2C_ADDR);
   if (!s_present) {
     Serial.println("[RTC] no PCF8583 found, using NTP");
     return;
@@ -260,7 +391,8 @@ void timeRefBegin() {
   }
 
   s_edgeQueue = xQueueCreate(1, sizeof(int64_t));
-  s_lastSecondEdge = esp_timer_get_time();
+  s_lastEdge = esp_timer_get_time();
+  s_phaseLogs = 2;
   xTaskCreatePinnedToCore(rtcTask, "rtc", 4096, NULL, 5, NULL, 1);
 
   pinMode(PIN_RTC_INT, INPUT_PULLUP);
@@ -287,6 +419,19 @@ int64_t timeRefNowUs() {
   return esp_timer_get_time() + timeRefOffsetUs();
 }
 
-void timeRefSyncRtc() {
-  if (timeRefUsingRtc()) s_syncRequest = true;
+void timeRefSyncRtc(bool trust) {
+  if (!timeRefUsingRtc()) return;
+  if (trust) s_syncTrust = true;
+  s_syncRequest = true;
+}
+
+void timeRefSetRtc(int64_t epoch, int64_t pressUs) {
+  if (!timeRefUsingRtc()) return;
+  portENTER_CRITICAL(&s_mux);
+  s_manualEpoch = epoch;
+  s_manualPressUs = pressUs;
+  s_manualRequest = true;
+  s_offsetUs = epoch * 1000000 - pressUs;   // show the new time at once
+  portEXIT_CRITICAL(&s_mux);
+  s_valid = true;
 }

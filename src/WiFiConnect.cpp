@@ -21,27 +21,27 @@
 
 static const char *textUI(uint16_t number) {
   switch (number) {
-    case 301: return "Kies een WiFi-netwerk om de IRIG-B masterclock te verbinden.";
-    case 302: return "WiFi configureren";
-    case 303: return "Verborgen netwerk";
-    case 304: return "Netwerknaam (SSID)";
+    case 301: return "Choose a WiFi network to connect the IRIG-B masterclock to.";
+    case 302: return "Configure WiFi";
+    case 303: return "Hidden network";
+    case 304: return "Network name (SSID)";
     case 305: return "SSID";
-    case 306: return "Wachtwoord";
-    case 307: return "Wachtwoord";
-    case 308: return "Opslaan en verbinden";
-    case 309: return "Opnieuw zoeken";
-    case 310: return "Verbinden met";
-    case 311: return "Verbonden met";
-    case 312: return "Dit access point wordt nu uitgeschakeld.";
-    case 313: return "Verbinden mislukt met";
-    case 314: return "Opnieuw proberen";
+    case 306: return "Password";
+    case 307: return "Password";
+    case 308: return "Save and connect";
+    case 309: return "Scan again";
+    case 310: return "Connecting to";
+    case 311: return "Connected to";
+    case 312: return "This access point will now shut down.";
+    case 313: return "Could not connect to";
+    case 314: return "Try again";
     case 315: return "IRIG-B masterclock";
-    case 316: return "WiFi configuratie";
-    case 317: return "Geen netwerken gevonden";
-    case 318: return "Verbinden";
-    case 323: return "DHCP (automatisch IP-adres)";
-    case 324: return "IP-adres";
-    case 325: return "Subnetmasker";
+    case 316: return "WiFi configuration";
+    case 317: return "No networks found";
+    case 318: return "Connecting";
+    case 323: return "DHCP (automatic IP address)";
+    case 324: return "IP address";
+    case 325: return "Subnet mask";
     case 326: return "Gateway";
     default:  return "";
   }
@@ -78,6 +78,11 @@ static const char TPL_STYLE[] PROGMEM =
     "transition:border .2s;-webkit-appearance:none}"
   "input[type=text]:focus,input[type=password]:focus{border-color:#5bd6ab}"
   "input::placeholder{color:#3a4250}"
+  "select{display:block;width:100%;padding:11px 14px;background:rgba(20,22,26,.5);"
+    "border:1px solid rgba(60,127,106,.22);border-radius:10px;color:#e0e4e8;font-size:.9em;"
+    "font-family:inherit;margin-bottom:10px;outline:0}"
+  "select:focus{border-color:#5bd6ab}"
+  "option{background:#202228}"
   ".n{background:rgba(20,22,26,.35);border:1px solid rgba(60,127,106,.12);"
     "border-radius:10px;padding:10px 12px;margin-bottom:5px;cursor:pointer;"
     "display:flex;align-items:center;gap:10px;transition:border .2s}"
@@ -171,6 +176,15 @@ WiFiConnectParam::WiFiConnectParam(const char *custom) {
 
 WiFiConnectParam::WiFiConnectParam(const char *id, const char *placeholder, const char *defaultValue, int length) {
   init(id, placeholder, defaultValue, length, "");
+}
+
+WiFiConnectParam::WiFiConnectParam(const char *id, int length) {
+  init(id, "", "", length, "");
+  _rawField = true;
+}
+
+void WiFiConnectParam::setCustomHTML(const char *html) {
+  _customHTML = html;
 }
 
 void WiFiConnectParam::init(const char *id, const char *placeholder, const char *defaultValue, int length, const char *custom) {
@@ -401,7 +415,7 @@ boolean WiFiConnect::startConfigurationPortal(int8_t cancelPin) {
 void WiFiConnect::handleRoot() {
   if (captivePortal()) return;
 
-  String page = F("<!DOCTYPE html><html lang='nl'><head>"
+  String page = F("<!DOCTYPE html><html lang='en'><head>"
     "<meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1,user-scalable=no'>"
     "<title>");
@@ -422,7 +436,7 @@ void WiFiConnect::handleRoot() {
 }
 
 void WiFiConnect::handleWifi() {
-  String page = F("<!DOCTYPE html><html lang='nl'><head>"
+  String page = F("<!DOCTYPE html><html lang='en'><head>"
     "<meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1,user-scalable=no'>"
     "<title>");
@@ -500,7 +514,9 @@ void WiFiConnect::handleWifi() {
   for (int i = 0; i < _paramsCount; i++) {
     if (_params[i] == NULL) break;
 
-    if (_params[i]->getID() != NULL) {
+    if (_params[i]->_rawField) {
+      page += _params[i]->getCustomHTML();
+    } else if (_params[i]->getID() != NULL) {
       char parLength[4];
       snprintf(parLength, 4, "%d", _params[i]->getValueLength());
       page += F("<input type='text' id='");
@@ -622,7 +638,7 @@ void WiFiConnect::handleWifiSave() {
     _gw = gw;
   }
 
-  String page = F("<!DOCTYPE html><html lang='nl'><head>"
+  String page = F("<!DOCTYPE html><html lang='en'><head>"
     "<meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1,user-scalable=no'>"
     "<title>");
