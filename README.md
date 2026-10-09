@@ -43,7 +43,8 @@ B122 has no summer time flag. With automatic summer time the time in the signal 
 - When a PCF8583 real-time clock is connected, it is the master clock (see below).
 - A hardware timer drives the DAC at 40 kHz (40 samples per sine period). Every bit starts on a positive zero crossing of the sine.
 - At every frame start the firmware compares the moment with the master clock (PCF8583 or NTP) and corrects if needed in steps of 25 µs, at most one step per bit. If the deviation exceeds 100 ms, the output restarts on the next second.
-- If WiFi or NTP is lost, the output keeps running on the ESP32's internal clock (drift in the order of a few tens of ms per hour).
+- If WiFi or NTP is lost after a sync, the output keeps running on the ESP32's internal clock (drift in the order of a few tens of ms per hour).
+- Without any valid time (no PCF8583, no NTP sync and no time set by hand) the IRIG-B output is off and the display shows `--:--:--`.
 - The accuracy is that of NTP over WiFi: roughly 1–10 ms relative to UTC. WiFi power saving is switched off for this: with power saving on, NTP replies wait for the next beacon and the time can be off by a few hundred ms.
 
 ### PCF8583 real-time clock (optional)
@@ -54,6 +55,7 @@ With a battery-backed PCF8583 the clock starts right after power-up, even withou
 - **From then on the PCF8583 is the master clock.** The frames run on the PCF8583's 1 Hz pulse (INT pin); the ESP32 clock is not used for that. The 1 Hz edges do not fall on the PCF8583's seconds tick, so after each edge the firmware reads the hundredths register until it changes and calculates where in the PCF second the edge falls (about 0.1 ms precision).
 - **NTP corrects the PCF8583.** After every NTP sync the deviation is measured and logged. If two checks in a row exceed 20 ms (`RTC_SET_THRESHOLD_US`) in the same direction, the PCF8583 is set again, exactly on the second boundary. A single bad NTP sample therefore never moves the master clock. Two exceptions: the first NTP sync after switching NTP back on with the SET button, and a deviation of more than 0.5 s (`RTC_IMMEDIATE_US`), are corrected straight away.
 - **No PCF8583 found**, or no 1 Hz pulse on INT: everything works as without a PCF8583, on NTP.
+- **The PCF8583 is searched for continuously.** One that is missed at start-up or plugged in later is used within a second. One that stops answering is dropped (`[RTC] PCF8583 lost` in the log): the clock then falls back to NTP, or, without NTP, has no time and stops the IRIG-B output. It does not keep running on the ESP32 clock.
 - The PCF8583 holds UTC. The full year and a validity marker are stored in its RAM (the PCF8583 itself only counts 2 year bits). A PCF8583 set by another device or program is therefore seen as invalid and set from NTP.
 
 ### OLED display (optional)

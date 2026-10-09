@@ -285,10 +285,11 @@ void loop() {
     startNtp();
   }
 
-  // Output starts on a valid PCF8583 time, the first NTP sync or a manually
-  // set time, and then keeps running, also when WiFi or NTP is lost.
+  // Output runs while there is a valid time: from the PCF8583, from NTP
+  // (also after WiFi is lost, on the ESP32 clock) or set by hand. Without
+  // any of these, for example PCF8583 removed and no NTP, it stops.
   bool timeValid = timeRefRtcValid() || ntpSynced || manualTimeSet;
-  if (timeValid && !irigRunning()) irigEnable(true);
+  irigEnable(timeValid);
   displaySetStatus(wifiUp, wifiUp ? WiFi.RSSI() : 0, timeValid, irigRunning(), cfgNtpOff);
 
   handleMenu(menuLoop(timeRefNowUs(), timeValid));
@@ -320,7 +321,7 @@ void loop() {
     localtime_r(&now, &tm);
     Serial.printf("[STAT] %04d-%02d-%02d %02d:%02d:%02d day %03d, clock %s, WiFi %s, NTP %s (%lu syncs), IRIG %s, phase %ld us\n",
                   tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
-                  tm.tm_yday + 1, timeRefRtcValid() ? "PCF8583" : (cfgNtpOff ? "manual" : "NTP"),
+                  tm.tm_yday + 1, timeRefRtcValid() ? "PCF8583" : (!timeValid ? "none" : (ntpSynced ? "NTP" : "manual")),
                   WiFi.status() == WL_CONNECTED ? "ok" : "down",
                   cfgNtpOff ? "off" : (ntpSynced ? "ok" : "waiting"), (unsigned long)ntpSyncCount,
                   irigRunning() ? "on" : "off", (long)irigLastErrorUs());

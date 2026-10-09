@@ -11,6 +11,9 @@
      together with a marker that says the time was set by this firmware.
    - The PCF8583 holds UTC; the IRIG frames are converted to local time.
    - All PCF8583 traffic runs in the RTC task, under the shared I2C bus lock.
+   - The PCF8583 is searched for continuously: one that is missed at start-up
+     or plugged in later is picked up within a second, and one that stops
+     answering is dropped (the clock then falls back to NTP, or has no time).
 */
 #include "TimeRef.h"
 
@@ -46,7 +49,8 @@ struct RtcTime {
   int64_t epoch;                // UTC seconds
 };
 
-static bool              s_present = false;   // PCF8583 answers on I2C
+static volatile bool     s_present = false;   // PCF8583 answers on I2C
+static bool              s_absentLogged = false;
 static volatile bool     s_failed = false;    // no 1 Hz on INT: fall back to system clock
 static volatile bool     s_valid = false;     // PCF8583 holds a valid time
 static volatile bool     s_syncRequest = false;
@@ -265,6 +269,8 @@ static bool edgePcfTime(const RtcTime &t, int64_t edge, int64_t &pcfUs) {
   return ok;
 }
 
+static void initPcf();
+
 static void rtcTask(void *) {
   for (;;) {
     if (s_manualRequest) {
@@ -276,12 +282,34 @@ static void rtcTask(void *) {
       setRtcManual(epoch, pressUs);
     }
 
+    if (!s_present) {
+      if (i2cProbe(RTC_I2C_ADDR)) {
+        initPcf();
+      } else {
+        if (!s_absentLogged) {
+          Serial.println("[RTC] no PCF8583 found, using NTP");
+          s_absentLogged = true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+      }
+      continue;
+    }
+
     int64_t edge;
     if (xQueueReceive(s_edgeQueue, &edge, pdMS_TO_TICKS(50)) != pdTRUE) {
-      if (!s_failed && esp_timer_get_time() - s_lastEdge > EDGE_TIMEOUT_US) {
-        s_failed = true;
-        s_valid = false;
-        Serial.printf("[RTC] no 1 Hz signal on GPIO%d, using NTP only\n", PIN_RTC_INT);
+      if (esp_timer_get_time() - s_lastEdge > EDGE_TIMEOUT_US) {
+        if (!i2cProbe(RTC_I2C_ADDR)) {
+          s_present = false;
+          s_failed = false;
+          s_valid = false;
+          s_absentLogged = true;
+          Serial.println("[RTC] PCF8583 lost (no answer on I2C), using NTP");
+        } else if (!s_failed) {
+          s_failed = true;
+          s_valid = false;
+          Serial.printf("[RTC] no 1 Hz signal on GPIO%d, using NTP only\n", PIN_RTC_INT);
+        }
+        s_lastEdge = esp_timer_get_time();     // check again in EDGE_TIMEOUT_US
       }
       continue;
     }
@@ -366,12 +394,15 @@ static void rtcTask(void *) {
 
 void timeRefBegin() {
   i2cBegin();
-  s_present = i2cProbe(RTC_I2C_ADDR);
-  if (!s_present) {
-    Serial.println("[RTC] no PCF8583 found, using NTP");
-    return;
-  }
+  s_edgeQueue = xQueueCreate(1, sizeof(int64_t));
+  xTaskCreatePinnedToCore(rtcTask, "rtc", 4096, NULL, 5, NULL, 1);
 
+  pinMode(PIN_RTC_INT, INPUT_PULLUP);
+  attachInterrupt(PIN_RTC_INT, onRtcEdge, CHANGE);
+}
+
+/// PCF8583 found (at start-up or later): set it up and start using it
+static void initPcf() {
   // Clock mode, counting, unmasked, alarm off (1 Hz on INT)
   uint8_t ctrl;
   if (rtcRead(REG_CONTROL, &ctrl, 1) && (ctrl & (CTRL_STOP | CTRL_FUNCTION | CTRL_MASK | CTRL_ALARM_EN))) {
@@ -387,16 +418,17 @@ void timeRefBegin() {
     Serial.printf("[RTC] PCF8583 found, time %04d-%02d-%02d %02d:%02d:%02d UTC\n",
                   tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
   } else {
-    Serial.println("[RTC] PCF8583 found, no valid time: waiting for NTP");
+    Serial.println("[RTC] PCF8583 found, no valid time: set it by hand or wait for NTP");
   }
 
-  s_edgeQueue = xQueueCreate(1, sizeof(int64_t));
+  xQueueReset(s_edgeQueue);
   s_lastEdge = esp_timer_get_time();
   s_phaseLogs = 2;
-  xTaskCreatePinnedToCore(rtcTask, "rtc", 4096, NULL, 5, NULL, 1);
-
-  pinMode(PIN_RTC_INT, INPUT_PULLUP);
-  attachInterrupt(PIN_RTC_INT, onRtcEdge, CHANGE);
+  s_haveOffset = false;
+  s_lastDevDir = 0;
+  s_failed = false;
+  s_absentLogged = false;
+  s_present = true;
 }
 
 bool timeRefUsingRtc() {
